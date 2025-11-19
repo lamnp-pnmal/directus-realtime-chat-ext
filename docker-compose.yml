@@ -1,0 +1,23 @@
+services: 
+  directus:
+    image: directus/directus:latest
+    ports: 
+      - 8055:8055
+    volumes:
+      - ./database:/directus/database
+      - ./uploads:/directus/uploads
+      - ./extensions:/directus/extensions
+    environment:
+      KEY: '3120931491283401301230'
+      SECRET: 'mamamia-shibainu-kekw'
+
+      DB_CLIENT: 'sqlite3'
+      DB_FILENAME: '/directus/database/data.db'
+
+      CONTENT_SECURITY_POLICY_DIRECTIVES__SCRIPT_SRC: "array:'self', 'unsafe-eval', 'unsafe-inline'"
+
+      WEBSOCKETS_ENABLED: true
+      WEBSOCKETS_HEARTBEAT_ENABLED: true
+
+      ADMIN_EMAIL: 'superlamvt@gmail.com'
+      ADMIN_PASSWORD: '2312004lamvt'
