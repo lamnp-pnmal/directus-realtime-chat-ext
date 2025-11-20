@@ -1,53 +1,99 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, inject, nextTick } from "vue";
+import { readItems } from "@directus/sdk";
+import client, { type Message } from "./directus";
 
 const api = inject("api") as any;
 
-type Message = {
-    id: string;
-    user_created: {
-        id: string;
-        first_name: string;
-        last_name?: string;
-    };
-    text: string;
-    date_created: string;
-};
-
 const messages = ref<Message[]>([]);
 const newMessage = ref("");
-const currentUser = ref(null);
+const currentUser = ref<string | null>(null);
+const isConnected = ref(false);
 const isLoading = ref(true);
-let pollingInterval: ReturnType<typeof setInterval> | null = null;
 
-const fetchMessages = async () => {
+const initWebSocket = async () => {
     try {
-        const response = await api.get("/items/messages", {
-            params: {
-                sort: "date_created",
+        console.log("1. Connecting with Static Token...");
+
+        const token = "-hGnmosV00iSJIiuywESB5KuXIij6QTY";
+
+        if (!token)
+            throw new Error("Please put your static token in the code!");
+
+        client.setToken(token);
+
+        await client.connect();
+
+        client.onWebSocket("message", (data) => {
+            if (data.type === "ping") client.sendMessage({ type: "pong" });
+
+            if (data.type === "auth" && data.status === "ok") {
+                console.log("WebSocket Authenticated!");
+                isConnected.value = true;
+                subscribeToMessages();
+                fetchHistory();
+            }
+
+            if (data.type === "subscription" && data.event === "create") {
+                const newMsg = data.data[0];
+                messages.value.push(newMsg);
+                scrollToBottom();
+            }
+        });
+
+        client.sendMessage({ type: "auth", access_token: token });
+    } catch (e) {
+        console.error("WebSocket setup failed:", e);
+        isLoading.value = false;
+    }
+};
+
+const subscribeToMessages = () => {
+    client.sendMessage({
+        type: "subscribe",
+        collection: "messages",
+        event: "create",
+        query: {
+            fields: [
+                "id",
+                "text",
+                "user_created.first_name",
+                "user_created.id",
+                "date_created",
+            ],
+        },
+    });
+};
+
+const fetchHistory = async () => {
+    try {
+        // 2. The SDK now KNOWS this returns Message[]
+        // You do not need to force it or ignore it.
+        const history = await client.request(
+            readItems("messages", {
+                sort: ["date_created"],
                 limit: 50,
                 fields: [
                     "id",
                     "text",
-                    "user_created.first_name",
-                    "user_created.id",
                     "date_created",
+                    {
+                        user_created: [
+                            "id",
+                            "first_name",
+                            "last_name",
+                            "email",
+                        ],
+                    },
                 ],
-            },
-        });
+            }),
+        );
 
-        const isFirstLoad = messages.value.length === 0;
-        const newCount = response.data.data.length;
-        const currentCount = messages.value.length;
+        messages.value = history;
 
-        messages.value = response.data.data;
-        isLoading.value = false;
-
-        if (isFirstLoad || newCount > currentCount) {
-            scrollToBottom();
-        }
-    } catch (error) {
-        console.error("Chat Load Error:", error);
+        scrollToBottom();
+    } catch (e) {
+        console.error("Failed to load history", e);
     }
 };
 
@@ -56,16 +102,14 @@ const sendMessage = async () => {
 
     const textToSend = newMessage.value;
     newMessage.value = "";
-
     try {
         await api.post("/items/messages", {
             text: textToSend,
         });
-        await fetchMessages();
     } catch (error) {
         console.error("Send Failed:", error);
         newMessage.value = textToSend;
-        alert("Failed to send message. Check console for permission errors.");
+        alert("Failed to send.");
     }
 };
 
@@ -73,9 +117,7 @@ const fetchMe = async () => {
     try {
         const response = await api.get("/users/me");
         currentUser.value = response.data.data.id;
-    } catch (e) {
-        // Ignore error if we can't fetch "me"
-    }
+    } catch (e) {}
 };
 
 const scrollToBottom = () => {
@@ -85,42 +127,39 @@ const scrollToBottom = () => {
     });
 };
 
-onMounted(async () => {
-    if (!api) return;
-
-    await fetchMe();
-    await fetchMessages();
-
-    pollingInterval = setInterval(fetchMessages, 2000);
-});
-
-onUnmounted(() => {
-    if (pollingInterval) clearInterval(pollingInterval);
-});
-
 const formatTime = (isoString: string) => {
     if (!isoString) return "";
     const date = new Date(isoString);
     return new Intl.DateTimeFormat("default", {
         hour: "numeric",
         minute: "numeric",
-        month: "short",
-        day: "numeric",
     }).format(date);
 };
+
+onMounted(() => {
+    fetchMe();
+    initWebSocket();
+});
+
+onUnmounted(() => {
+    client.disconnect();
+});
 </script>
 
 <template>
     <div class="chat-widget">
         <div class="chat-header">
             <h3>Team Chat</h3>
-            <div class="live-indicator"><span class="dot"></span> Live</div>
+            <div class="live-indicator">
+                <span class="dot" :class="{ active: isConnected }"></span>
+                {{ isConnected ? "Live Socket" : "Connecting..." }}
+            </div>
         </div>
 
         <div class="messages-window">
-            <div v-if="isLoading" class="loading">Loading messages...</div>
+            <div v-if="isLoading" class="loading">Starting Engine...</div>
             <div v-else-if="messages.length === 0" class="empty">
-                No messages yet. Say hi!
+                No messages yet.
             </div>
 
             <div
@@ -132,9 +171,7 @@ const formatTime = (isoString: string) => {
                 <small class="username">{{
                     msg.user_created?.first_name || "Unknown"
                 }}</small>
-
                 <div class="text">{{ msg.text }}</div>
-
                 <small class="timestamp">{{
                     formatTime(msg.date_created)
                 }}</small>
@@ -146,14 +183,17 @@ const formatTime = (isoString: string) => {
                 v-model="newMessage"
                 @keyup.enter="sendMessage"
                 placeholder="Type a message..."
+                :disabled="!isConnected"
             />
-            <button @click="sendMessage">Send</button>
+            <button @click="sendMessage" :disabled="!isConnected">Send</button>
         </div>
     </div>
 </template>
 
 <style scoped>
 .chat-widget {
+    --white: #ffffff;
+
     display: flex;
     flex-direction: column;
     height: 500px;
@@ -180,7 +220,7 @@ const formatTime = (isoString: string) => {
 
 .live-indicator {
     font-size: 12px;
-    color: var(--theme--primary);
+    color: var(--theme--foreground-subdued);
     display: flex;
     align-items: center;
     gap: 6px;
@@ -188,9 +228,13 @@ const formatTime = (isoString: string) => {
 .dot {
     width: 8px;
     height: 8px;
-    background: var(--theme--primary);
+    background: #ccc;
     border-radius: 50%;
-    animation: pulse 2s infinite;
+    transition: background 0.3s;
+}
+.dot.active {
+    background: var(--theme--primary);
+    box-shadow: 0 0 4px var(--theme--primary);
 }
 
 .messages-window {
@@ -206,7 +250,7 @@ const formatTime = (isoString: string) => {
     max-width: 75%;
     padding: 10px 14px;
     border-radius: 12px;
-    border-top-left-radius: 2px; /* Speech bubble effect */
+    border-top-left-radius: 2px;
     background-color: var(--theme--background-normal);
     align-self: flex-start;
     line-height: 1.4;
@@ -230,13 +274,15 @@ const formatTime = (isoString: string) => {
     margin-bottom: 4px;
     font-weight: 700;
 }
-
 .timestamp {
     display: block;
     font-size: 9px;
     opacity: 0.6;
     margin-top: 4px;
     text-align: right;
+}
+.my-message .timestamp {
+    color: rgba(255, 255, 255, 0.7);
 }
 
 .input-area {
@@ -255,6 +301,10 @@ input {
     background: var(--theme--background-page);
     color: var(--theme--foreground);
 }
+input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
 input:focus {
     outline: 2px solid var(--theme--primary);
     border-color: transparent;
@@ -268,21 +318,12 @@ button {
     border-radius: var(--theme--border-radius);
     cursor: pointer;
     font-weight: 600;
-    transition: opacity 0.2s;
 }
-button:hover {
+button:disabled {
+    background: #ccc;
+    cursor: not-allowed;
+}
+button:hover:not(:disabled) {
     opacity: 0.9;
-}
-
-@keyframes pulse {
-    0% {
-        opacity: 1;
-    }
-    50% {
-        opacity: 0.4;
-    }
-    100% {
-        opacity: 1;
-    }
 }
 </style>
